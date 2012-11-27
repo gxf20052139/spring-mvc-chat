@@ -3,11 +3,11 @@ package org.springframework.samples.async.chat;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Controller;
-import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -15,62 +15,55 @@ import org.springframework.web.bind.annotation.ResponseBody;
 import org.springframework.web.context.request.async.DeferredResult;
 
 @Controller
-@RequestMapping("/mvc/chat/{topic}/{user}")
+@RequestMapping("/mvc/chat")
 public class ChatController {
 
-	private final Map<String, ChatParticipant> chatParticipants = new ConcurrentHashMap<String, ChatParticipant>();
-
 	private final ChatRepository chatRepository;
+
+	private final Map<DeferredResult<List<String>>, Integer> chatRequests =
+			new ConcurrentHashMap<DeferredResult<List<String>>, Integer>();
+
 
 	@Autowired
 	public ChatController(ChatRepository chatRepository) {
 		this.chatRepository = chatRepository;
 	}
 
-	/**
-	 * Return chat messages immediately or hold the response till new chat messages
-	 * become available.
-	 */
-	@RequestMapping(method=RequestMethod.GET, produces="application/json")
+	@RequestMapping(method=RequestMethod.GET)
 	@ResponseBody
-	public Object getMessages(@PathVariable String topic, @PathVariable String user, @RequestParam int messageIndex) {
-		ChatParticipant participant = getChatParticipant(topic, user);
-		DeferredResult<List<String>> deferredResult = new DeferredResult<List<String>>(null, Collections.<String>emptyList());
-		List<String> messages = participant.getMessages(deferredResult, messageIndex);
-		return messages.isEmpty() ? deferredResult : messages;
-	}
+	public DeferredResult<List<String>> getMessages(@RequestParam int messageIndex) {
 
-	private ChatParticipant getChatParticipant(String topic, String user) {
-		String key = topic + ":" + user;
-		ChatParticipant participant = this.chatParticipants.get(key);
-		if (participant == null) {
-			participant = new ChatParticipant(topic, this.chatRepository);
-			this.chatParticipants.put(key, participant);
+		final DeferredResult<List<String>> deferredResult = new DeferredResult<List<String>>(null, Collections.emptyList());
+		this.chatRequests.put(deferredResult, messageIndex);
+
+		deferredResult.onCompletion(new Runnable() {
+			@Override
+			public void run() {
+				chatRequests.remove(deferredResult);
+			}
+		});
+
+		List<String> messages = this.chatRepository.getMessages(messageIndex);
+		if (!messages.isEmpty()) {
+			deferredResult.setResult(messages);
 		}
-		return participant;
+
+		return deferredResult;
 	}
 
-	/**
-	 * Post a message to participants in the chat.
-	 */
 	@RequestMapping(method=RequestMethod.POST)
 	@ResponseBody
-	public void postMessage(@PathVariable String topic, @PathVariable String user, @RequestParam String message) {
-		String chatMessage = "[" + user + "] " + message;
-		this.chatRepository.addMessage(topic, chatMessage);
-		for (ChatParticipant participant : this.chatParticipants.values()) {
-			participant.handleMessage(topic, chatMessage);
-		}
-	}
+	public void postMessage(@RequestParam String message) {
 
-	/**
-	 * End participation in a chat.
-	 */
-	@RequestMapping(method=RequestMethod.DELETE)
-	@ResponseBody
-	public void removeParticipant(@PathVariable String topic, @PathVariable String user) {
-		ChatParticipant participant = this.chatParticipants.remove(topic + ":" + user);
-		participant.exitChat();
+		this.chatRepository.addMessage(message);
+
+		// Update all chat requests as part of the POST request
+		// See Redis branch for a more sophisticated, non-blocking approach
+
+		for (Entry<DeferredResult<List<String>>, Integer> entry : this.chatRequests.entrySet()) {
+			List<String> messages = this.chatRepository.getMessages(entry.getValue());
+			entry.getKey().setResult(messages);
+		}
 	}
 
 }
